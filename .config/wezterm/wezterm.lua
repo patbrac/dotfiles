@@ -5,6 +5,6 @@ local config = {}
 config.color_scheme = "catppuccin-mocha"
 
 -- Font
-config.font = wezterm.font("MesloLGS NF")
+config.font = wezterm.font("Fira Code")
 
 return config
