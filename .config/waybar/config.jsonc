@@ -18,11 +18,13 @@
     "hyprland/workspaces"
   ],
   "modules-right": [
+    "mpd",
     "pulseaudio",
     "network",
     "cpu",
     "memory",
     "keyboard-state",
+    "temperature",
     "battery",
     "clock",
     "tray",
