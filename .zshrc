@@ -116,7 +116,7 @@ export LANG=en_US.UTF-8
 
 export PATH="$PATH:/home/${USER}/.modular/bin"
 export PATH="$PATH:/usr/local/go/bin"
-export PATH="$PATH:/opt"
+export PATH="$PATH:/opt/nvim/bin"
 export PATH="$PATH:/opt/node/bin"
 export PATH="$PATH:/usr/local/lua-language-server/bin"
 # To customize prompt, run `p10k configure` or edit ~/.p10k.zsh.
