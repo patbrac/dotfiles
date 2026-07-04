@@ -1,132 +1,396 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  Ubuntu Post-Install Setup Script
-#  Pull & run: curl -fsSL https://raw.githubusercontent.com/<you>/dotfiles/main/ubuntu-setup.sh | bash
-#  Or clone and run: ./ubuntu-setup.sh
+#  ubuntu-setup.sh — Ubuntu post-install setup for developer machines
+#
+#  Installs a curated dev environment: shell, terminal, editor, toolchains,
+#  containers and CLI tools. Pick modules interactively or via flags.
+#
+#  Usage:
+#    sudo ./ubuntu-setup.sh                     interactive checklist
+#    sudo ./ubuntu-setup.sh --all               everything, unattended
+#    sudo ./ubuntu-setup.sh --only zsh,neovim   just those modules
+#    ./ubuntu-setup.sh --list                   show available modules
+#
+#  One-liner (the menu reads from /dev/tty, so it stays interactive):
+#    curl -fsSL https://raw.githubusercontent.com/<you>/dotfiles/main/ubuntu-setup.sh | sudo bash
+#
+#  Tested against Ubuntu 24.04 and 26.04 on amd64/arm64.
 # ============================================================================
-set -euo pipefail
 
-# ── Colors & formatting ────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
-OPT_DIR="/opt"
+# ── Constants ───────────────────────────────────────────────────────────────
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
+    CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; NC=$'\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; NC=''
+fi
+readonly RED GREEN YELLOW CYAN BOLD DIM NC
 
-# ── Helper functions ────────────────────────────────────────────────────────
-info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
-success() { echo -e "${GREEN}[  OK]${NC}  $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-fail()    { echo -e "${RED}[FAIL]${NC}  $*"; }
+readonly OPT_DIR="/opt"
+readonly KEYRING_DIR="/etc/apt/keyrings"
+readonly CURL=(curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 15)
+RULE="$(printf '─%.0s' {1..62})"
+readonly RULE
 
+# Globals filled in by detect_system()
+OS_PRETTY="" OS_CODENAME="" ARCH_DEB="" ARCH_NODE="" ARCH_NVIM="" ARCH_JAVA=""
+ACTUAL_USER="" ACTUAL_HOME=""
+
+# Runtime state
+RUN_MODE="menu"           # menu | all | only
+WORKDIR=""
+CURSOR=0
+MENU_MSG=""
+STEP_INDEX=0
+TOTAL_STEPS=0
+CURRENT_MODULE=""
+
+# ── Module registry ─────────────────────────────────────────────────────────
+declare -A MODULES=(
+    [clitools]="CLI tools (ripgrep, fd, bat, jq, htop, tmux, tree …)"
+    [zsh]="Zsh + Oh-My-Zsh"
+    [firacode]="FiraCode Nerd Font"
+    [neovim]="Neovim (latest stable from GitHub)"
+    [stow]="GNU Stow (dotfile symlinks)"
+    [java]="Java (Adoptium Temurin 21 JDK)"
+    [gradle]="Gradle (latest)"
+    [rust]="Rust (via rustup)"
+    [python]="Python tooling (uv)"
+    [cpp]="C/C++ toolchain (gcc, g++, cmake, gdb)"
+    [docker]="Docker Engine + Compose"
+    [nodejs]="Node.js LTS (installed to /opt)"
+    [claude]="Claude Code (Anthropic's CLI coding agent)"
+)
+MODULE_ORDER=(clitools zsh firacode neovim stow java gradle rust python cpp docker nodejs claude)
+
+declare -A SELECTED=()
+for key in "${MODULE_ORDER[@]}"; do
+    SELECTED[$key]=1   # everything selected by default
+done
+unset key
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+info()    { printf '%s\n' "  ${CYAN}·${NC} $*"; }
+success() { printf '%s\n' "  ${GREEN}✓${NC} $*"; }
+warn()    { printf '%s\n' "  ${YELLOW}!${NC} $*"; }
+fail()    { printf '%s\n' "  ${RED}✗${NC} $*" >&2; }
+
+heading() {  # heading "<tag>" "<title>"
+    printf '\n%s\n' "${BOLD}${CYAN}[$1]${NC} ${BOLD}$2${NC}"
+}
+
+# ── Traps ───────────────────────────────────────────────────────────────────
+cleanup() {
+    if [[ -n "$WORKDIR" ]]; then
+        rm -rf "$WORKDIR"
+    fi
+    printf '\e[?25h'   # always restore the cursor
+}
+
+on_error() {
+    fail "Setup failed${CURRENT_MODULE:+ during \"${CURRENT_MODULE}\"} (line $1). See output above."
+}
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
 need_root() {
     if [[ $EUID -ne 0 ]]; then
-        fail "This script must be run as root (or with sudo)."
+        fail "This script must be run as root:  sudo $0"
         exit 1
     fi
 }
 
-ACTUAL_USER="${SUDO_USER:-$USER}"
-ACTUAL_HOME=$(eval echo "~${ACTUAL_USER}")
-
 run_as_user() {
-    sudo -u "$ACTUAL_USER" -- bash -c "$*"
+    sudo -u "$ACTUAL_USER" -H -- bash -c "$*"
+}
+
+apt_update()  { apt-get update -qq -o Acquire::Retries=3; }
+apt_install() { apt-get install -y -qq -o Acquire::Retries=3 "$@"; }
+
+add_apt_keyring() {  # add_apt_keyring <name> <key-url>  → $KEYRING_DIR/<name>.gpg
+    install -d -m 0755 "$KEYRING_DIR"
+    "${CURL[@]}" "$2" | gpg --dearmor --yes -o "${KEYRING_DIR}/$1.gpg"
+    chmod 0644 "${KEYRING_DIR}/$1.gpg"
+}
+
+apt_suite_exists() {  # apt_suite_exists <repo-base-url> <suite>
+    "${CURL[@]}" --max-time 20 -o /dev/null "${1%/}/dists/$2/Release"
+}
+
+# Print the first suite the repo actually serves. New Ubuntu releases often
+# aren't in third-party repos yet, so callers pass an LTS fallback.
+pick_apt_suite() {  # pick_apt_suite <repo-base-url> <suite> [suite…]
+    local base="$1" s
+    shift
+    for s in "$@"; do
+        if apt_suite_exists "$base" "$s"; then
+            printf '%s\n' "$s"
+            return 0
+        fi
+    done
+    return 1
+}
+
+github_latest_tag() {  # github_latest_tag <owner/repo>
+    local tag
+    tag="$("${CURL[@]}" "https://api.github.com/repos/$1/releases/latest" | jq -r '.tag_name // empty')"
+    if [[ -z "$tag" ]]; then
+        fail "Could not resolve the latest release of $1 (GitHub API rate limit?)."
+        return 1
+    fi
+    printf '%s\n' "$tag"
+}
+
+detect_system() {
+    if [[ ! -r /etc/os-release ]]; then
+        fail "/etc/os-release not found — is this really Ubuntu?"
+        exit 1
+    fi
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS_PRETTY="${PRETTY_NAME:-Ubuntu}"
+    OS_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+    if [[ "${ID:-}" != "ubuntu" ]]; then
+        warn "This script targets Ubuntu — detected '${OS_PRETTY}'. Proceeding anyway."
+    fi
+    if [[ -z "$OS_CODENAME" ]]; then
+        warn "Could not detect the release codename — assuming 'noble' for apt repos."
+        OS_CODENAME="noble"
+    fi
+
+    ARCH_DEB="$(dpkg --print-architecture)"
+    case "$ARCH_DEB" in
+        amd64) ARCH_NODE="x64";   ARCH_NVIM="x86_64"; ARCH_JAVA="x64" ;;
+        arm64) ARCH_NODE="arm64"; ARCH_NVIM="arm64";  ARCH_JAVA="aarch64" ;;
+        *)
+            fail "Unsupported architecture '${ARCH_DEB}' — only amd64 and arm64 are supported."
+            exit 1
+            ;;
+    esac
+
+    ACTUAL_USER="${SUDO_USER:-$(id -un)}"
+    ACTUAL_HOME="$(getent passwd "$ACTUAL_USER" | cut -d: -f6)"
+    if [[ "$ACTUAL_USER" == "root" ]]; then
+        warn "No sudo user detected — user-level tools (zsh, rust, uv, Claude Code) will be set up for root."
+    fi
+}
+
+# ── CLI arguments ───────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+Ubuntu Developer Setup
+
+Usage: sudo $0 [options]
+
+Options:
+  -a, --all         Install all modules without showing the menu
+      --only LIST   Install a comma-separated list of modules (see --list)
+  -l, --list        List available modules and exit
+  -h, --help        Show this help and exit
+
+Examples:
+  sudo $0                       interactive checklist
+  sudo $0 --all                 everything, unattended
+  sudo $0 --only zsh,neovim     just those two modules
+
+Menu keys:  ↑/↓ or j/k move · space toggle · a all · n none · enter install · q quit
+EOF
+}
+
+list_modules() {
+    printf '%s\n' "Available modules (keys for --only):"
+    local key
+    for key in "${MODULE_ORDER[@]}"; do
+        printf '  %-10s %s\n' "$key" "${MODULES[$key]}"
+    done
+}
+
+set_only() {
+    local raw="$1" key pick found=0
+    for key in "${MODULE_ORDER[@]}"; do
+        SELECTED[$key]=0
+    done
+    local -a picks=()
+    IFS=',' read -ra picks <<< "$raw"
+    for pick in "${picks[@]}"; do
+        pick="${pick// /}"
+        if [[ -z "$pick" ]]; then
+            continue
+        fi
+        if [[ -v "MODULES[$pick]" ]]; then
+            SELECTED[$pick]=1
+            found=1
+        else
+            fail "Unknown module '${pick}'."
+            list_modules >&2
+            exit 1
+        fi
+    done
+    if [[ $found -eq 0 ]]; then
+        fail "--only requires at least one module key (see --list)."
+        exit 1
+    fi
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--all)   RUN_MODE="all" ;;
+            --only=*)   RUN_MODE="only"; set_only "${1#*=}" ;;
+            --only)
+                if [[ $# -lt 2 ]]; then
+                    fail "--only requires a value (see --list)."
+                    exit 1
+                fi
+                shift
+                RUN_MODE="only"; set_only "$1"
+                ;;
+            -l|--list)  list_modules; exit 0 ;;
+            -h|--help)  usage; exit 0 ;;
+            *)
+                fail "Unknown option: $1"
+                usage >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
 }
 
 # ── Interactive menu ────────────────────────────────────────────────────────
-declare -A MODULES=(
-    [zsh]="Zsh + Oh-My-Zsh"
-    [firacode]="FiraCode Nerd Font"
-    [ghostty]="Ghostty terminal"
-    [neovim]="Neovim (latest from GitHub)"
-    [stow]="GNU Stow (dotfile symlinks)"
-    [java]="Java (Adoptium Temurin 21 JDK)"
-    [gradle]="Gradle"
-    [rust]="Rust (via rustup)"
-    [python]="Python tooling (uv)"
-    [cpp]="C/C++ (gcc, g++, cmake, make)"
-    [docker]="Docker Engine + Compose"
-    [nodejs]="Node.js LTS (installed to /opt)"
-    [clitools]="CLI tools (ripgrep, fd, bat, curl, wget, jq, htop, tree, unzip, git)"
-)
-
-MODULE_ORDER=(zsh firacode ghostty neovim stow java gradle rust python cpp docker nodejs clitools)
-
-declare -A SELECTED
-for key in "${MODULE_ORDER[@]}"; do
-    SELECTED[$key]=1   # all selected by default
-done
-
-draw_menu() {
-    clear
-    echo -e "${BOLD}${CYAN}"
-    echo "  ╔══════════════════════════════════════════════════════════════╗"
-    echo "  ║            Ubuntu Post-Install Setup Script                 ║"
-    echo "  ╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-    echo -e "  Toggle items with their ${BOLD}number${NC}, then press ${BOLD}s${NC} to start.\n"
-
-    local i=1
+selected_count() {
+    local key n=0
     for key in "${MODULE_ORDER[@]}"; do
         if [[ ${SELECTED[$key]} -eq 1 ]]; then
-            echo -e "    ${GREEN}[✓]${NC} ${BOLD}${i})${NC}  ${MODULES[$key]}"
-        else
-            echo -e "    ${RED}[ ]${NC} ${BOLD}${i})${NC}  ${MODULES[$key]}"
+            n=$((n + 1))
         fi
-        ((i++))
+    done
+    printf '%s\n' "$n"
+}
+
+read_key() {
+    local k rest
+    IFS= read -rsn1 k </dev/tty || { printf 'quit\n'; return 0; }
+    case "$k" in
+        $'\e')
+            IFS= read -rsn2 -t 0.05 rest </dev/tty || true
+            case "${rest:-}" in
+                '[A'|'OA') printf 'up\n' ;;
+                '[B'|'OB') printf 'down\n' ;;
+                *)         printf 'nokey\n' ;;
+            esac
+            ;;
+        ''|$'\n'|$'\r') printf 'start\n' ;;
+        ' ')            printf 'toggle\n' ;;
+        j|J)            printf 'down\n' ;;
+        k|K)            printf 'up\n' ;;
+        a|A)            printf 'all\n' ;;
+        n|N)            printf 'none\n' ;;
+        s|S)            printf 'start\n' ;;
+        q|Q)            printf 'quit\n' ;;
+        *)              printf 'nokey\n' ;;
+    esac
+}
+
+draw_menu() {
+    local key box i=0
+    local total=${#MODULE_ORDER[@]} count
+    count="$(selected_count)"
+
+    printf '\e[H\n'
+    printf '%s\n' "  ${BOLD}Ubuntu Developer Setup${NC}"
+    printf '%s\n' "  ${DIM}${OS_PRETTY} · ${ARCH_DEB} · target user: ${ACTUAL_USER}${NC}"
+    printf '%s\n\n' "  ${DIM}${RULE}${NC}"
+
+    for key in "${MODULE_ORDER[@]}"; do
+        if [[ ${SELECTED[$key]} -eq 1 ]]; then
+            box="${GREEN}[✓]${NC}"
+        else
+            box="${DIM}[ ]${NC}"
+        fi
+        if [[ $i -eq $CURSOR ]]; then
+            printf '%s\n' "  ${CYAN}${BOLD}❯${NC} ${box} ${BOLD}${MODULES[$key]}${NC}"
+        else
+            printf '%s\n' "    ${box} ${MODULES[$key]}"
+        fi
+        i=$((i + 1))
     done
 
-    echo ""
-    echo -e "  ${BOLD}a)${NC} Select all    ${BOLD}n)${NC} Select none    ${BOLD}s)${NC} Start install    ${BOLD}q)${NC} Quit"
-    echo ""
+    printf '\n%s\n' "  ${DIM}${RULE}${NC}"
+    printf '%s\n' "  ${DIM}${count}/${total} selected${NC}"
+    printf '%s\n' "  ${DIM}↑/↓ move · space toggle · a all · n none ·${NC} ${BOLD}enter install${NC} ${DIM}· q quit${NC}"
+    printf '%s\n' "  ${YELLOW}${MENU_MSG}${NC}"
+    printf '\e[J'
 }
 
 interactive_menu() {
+    if ! ( : </dev/tty ) 2>/dev/null; then
+        fail "No terminal available for the interactive menu."
+        info "Run non-interactively instead:  --all  or  --only <modules>  (see --help)."
+        exit 1
+    fi
+
+    local total=${#MODULE_ORDER[@]} action key
+    printf '\e[?25l\e[2J'
     while true; do
         draw_menu
-        read -rp "  ▸ Choice: " choice
-        case "$choice" in
-            [1-9]|1[0-3])
-                local idx=$((choice - 1))
-                if [[ $idx -lt ${#MODULE_ORDER[@]} ]]; then
-                    local key="${MODULE_ORDER[$idx]}"
-                    SELECTED[$key]=$(( 1 - ${SELECTED[$key]} ))
-                fi
+        action="$(read_key)"
+        case "$action" in
+            up)     CURSOR=$(( (CURSOR - 1 + total) % total )) ;;
+            down)   CURSOR=$(( (CURSOR + 1) % total )) ;;
+            toggle)
+                key="${MODULE_ORDER[$CURSOR]}"
+                SELECTED[$key]=$(( 1 - SELECTED[$key] ))
+                MENU_MSG=""
                 ;;
-            a|A)
+            all)
                 for key in "${MODULE_ORDER[@]}"; do SELECTED[$key]=1; done
+                MENU_MSG=""
                 ;;
-            n|N)
+            none)
                 for key in "${MODULE_ORDER[@]}"; do SELECTED[$key]=0; done
+                MENU_MSG=""
                 ;;
-            s|S) break ;;
-            q|Q) echo "Aborted."; exit 0 ;;
-            *)   ;;
+            start)
+                if [[ "$(selected_count)" -gt 0 ]]; then
+                    break
+                fi
+                MENU_MSG="Nothing selected — toggle at least one module, or press q to quit."
+                ;;
+            quit)
+                printf '\e[?25h\n'
+                info "Aborted — nothing was installed."
+                exit 0
+                ;;
         esac
     done
+    printf '\e[?25h\e[2J\e[H'
 }
 
-# ── Module: Core apt update ─────────────────────────────────────────────────
-do_apt_update() {
-    info "Updating package lists …"
-    apt-get update -qq
-    apt-get upgrade -y -qq
-    apt-get install -y -qq software-properties-common apt-transport-https \
-        ca-certificates gnupg lsb-release curl wget
-    success "Base packages up to date."
+# ── Module: base system ─────────────────────────────────────────────────────
+base_prepare() {
+    heading "prep" "System update & prerequisites"
+    info "Refreshing package lists and upgrading the base system …"
+    apt_update
+    apt-get upgrade -y -qq -o Acquire::Retries=3
+    apt_install ca-certificates curl wget git gnupg jq tar unzip xz-utils
+    success "Base system ready."
 }
 
 # ── Module: CLI tools ───────────────────────────────────────────────────────
 install_clitools() {
     info "Installing CLI tools …"
-    apt-get install -y -qq \
+    apt_install \
         git curl wget unzip jq htop tree tmux \
-        ripgrep fd-find bat xclip
-    # fd and bat are installed under different names on Ubuntu
-    if [[ ! -L /usr/local/bin/fd ]]; then
-        ln -sf "$(which fdfind)" /usr/local/bin/fd 2>/dev/null || true
+        ripgrep fd-find bat xclip wl-clipboard
+    # Ubuntu ships these under different binary names — expose the usual ones.
+    if command -v fdfind >/dev/null; then
+        ln -sf "$(command -v fdfind)" /usr/local/bin/fd
     fi
-    if [[ ! -L /usr/local/bin/bat ]]; then
-        ln -sf "$(which batcat)" /usr/local/bin/bat 2>/dev/null || true
+    if command -v batcat >/dev/null; then
+        ln -sf "$(command -v batcat)" /usr/local/bin/bat
     fi
     success "CLI tools installed."
 }
@@ -134,7 +398,7 @@ install_clitools() {
 # ── Module: Zsh + Oh-My-Zsh ─────────────────────────────────────────────────
 install_zsh() {
     info "Installing Zsh …"
-    apt-get install -y -qq zsh
+    apt_install zsh
 
     info "Installing Oh-My-Zsh for ${ACTUAL_USER} …"
     if [[ ! -d "${ACTUAL_HOME}/.oh-my-zsh" ]]; then
@@ -143,308 +407,310 @@ install_zsh() {
         warn "Oh-My-Zsh already installed — skipping."
     fi
 
-    chsh -s "$(which zsh)" "$ACTUAL_USER"
+    chsh -s "$(command -v zsh)" "$ACTUAL_USER"
     success "Zsh is now the default shell for ${ACTUAL_USER}."
 }
 
-# ── Module: FiraCode Nerd Font ───────────────────────────────────────────────
+# ── Module: FiraCode Nerd Font ──────────────────────────────────────────────
 install_firacode() {
     info "Installing FiraCode Nerd Font …"
+    apt_install fontconfig
+
+    local tag
+    tag="$(github_latest_tag ryanoasis/nerd-fonts)"
+
     local font_dir="${ACTUAL_HOME}/.local/share/fonts/FiraCode"
-    mkdir -p "$font_dir"
+    run_as_user "mkdir -p '${font_dir}'"
 
-    local latest
-    latest=$(curl -fsSL "https://api.github.com/repos/ryanoasis/nerd-fonts/releases/latest" \
-        | jq -r '.tag_name')
-
-    curl -fsSL "https://github.com/ryanoasis/nerd-fonts/releases/download/${latest}/FiraCode.tar.xz" \
-        -o /tmp/FiraCode.tar.xz
-    tar -xf /tmp/FiraCode.tar.xz -C "$font_dir"
-    chown -R "${ACTUAL_USER}:${ACTUAL_USER}" "$font_dir"
-    fc-cache -fv > /dev/null 2>&1
-    rm -f /tmp/FiraCode.tar.xz
-    success "FiraCode Nerd Font ${latest} installed."
+    "${CURL[@]}" "https://github.com/ryanoasis/nerd-fonts/releases/download/${tag}/FiraCode.tar.xz" \
+        -o "${WORKDIR}/FiraCode.tar.xz"
+    tar -xf "${WORKDIR}/FiraCode.tar.xz" -C "$font_dir"
+    chown -R "${ACTUAL_USER}:" "$font_dir"
+    run_as_user "fc-cache -f '${font_dir}'" >/dev/null 2>&1 || true
+    success "FiraCode Nerd Font ${tag} installed."
 }
 
-# ── Module: Ghostty ──────────────────────────────────────────────────────────
-install_ghostty() {
-    info "Installing Ghostty terminal …"
-
-    # Ghostty provides an apt repo for Ubuntu 24.04+
-    if [[ ! -f /etc/apt/keyrings/ghostty-archive-keyring.gpg ]]; then
-        curl -fsSL https://pkg.ghostty.org/gpg.key \
-            | gpg --dearmor -o /etc/apt/keyrings/ghostty-archive-keyring.gpg
-    fi
-
-    local codename
-    codename=$(lsb_release -cs)
-
-    cat > /etc/apt/sources.list.d/ghostty.list <<EOF
-deb [signed-by=/etc/apt/keyrings/ghostty-archive-keyring.gpg] https://pkg.ghostty.org/apt ${codename} main
-EOF
-
-    apt-get update -qq
-    apt-get install -y -qq ghostty
-    success "Ghostty installed."
-}
-
-# ── Module: Neovim (latest GitHub release) ───────────────────────────────────
+# ── Module: Neovim (latest GitHub release) ──────────────────────────────────
 install_neovim() {
     info "Installing Neovim (latest stable from GitHub) …"
-    local latest
-    latest=$(curl -fsSL "https://api.github.com/repos/neovim/neovim/releases/latest" \
-        | jq -r '.tag_name')
+    local tag
+    tag="$(github_latest_tag neovim/neovim)"
 
     local nvim_dir="${OPT_DIR}/nvim"
+    rm -rf "$nvim_dir"
     mkdir -p "$nvim_dir"
 
-    curl -fsSL "https://github.com/neovim/neovim/releases/download/${latest}/nvim-linux-x86_64.tar.gz" \
-        -o /tmp/nvim.tar.gz
-    tar -xzf /tmp/nvim.tar.gz -C "$nvim_dir" --strip-components=1
+    "${CURL[@]}" "https://github.com/neovim/neovim/releases/download/${tag}/nvim-linux-${ARCH_NVIM}.tar.gz" \
+        -o "${WORKDIR}/nvim.tar.gz"
+    tar -xzf "${WORKDIR}/nvim.tar.gz" -C "$nvim_dir" --strip-components=1
     ln -sf "${nvim_dir}/bin/nvim" /usr/local/bin/nvim
-    rm -f /tmp/nvim.tar.gz
-    success "Neovim ${latest} installed to ${nvim_dir}."
+    success "Neovim ${tag} installed to ${nvim_dir}."
 }
 
 # ── Module: GNU Stow ────────────────────────────────────────────────────────
 install_stow() {
     info "Installing GNU Stow …"
-    apt-get install -y -qq stow
+    apt_install stow
     success "Stow installed."
 }
 
-# ── Module: Java (Adoptium Temurin 21) ───────────────────────────────────────
+# ── Module: Java (Adoptium Temurin 21) ──────────────────────────────────────
 install_java() {
     info "Installing Adoptium Temurin 21 JDK …"
 
-    apt-get install -y -qq wget apt-transport-https gpg
-
-    local codename
-    codename=$(awk -F= '/^VERSION_CODENAME/{print$2}' /etc/os-release)
-
-    # ── Strategy 1: Try the Adoptium apt repo ────────────────────────────
-    #    New Ubuntu releases (e.g. 26.04 "resolute") may not have a repo yet.
-    #    We try the native codename first, then fall back to "noble" (24.04).
-    local apt_success=false
-
-    for try_codename in "$codename" "noble"; do
-        info "Trying Adoptium apt repo with codename: ${try_codename} …"
-
-        # Download and dearmor the GPG key
-        if [[ ! -f /etc/apt/trusted.gpg.d/adoptium.gpg ]]; then
-            wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
-                | gpg --dearmor \
-                | tee /etc/apt/trusted.gpg.d/adoptium.gpg > /dev/null
+    local suite
+    if suite="$(pick_apt_suite "https://packages.adoptium.net/artifactory/deb" "$OS_CODENAME" noble)"; then
+        if [[ "$suite" != "$OS_CODENAME" ]]; then
+            warn "Adoptium has no '${OS_CODENAME}' repo yet — using '${suite}' (binary compatible)."
         fi
-
-        echo "deb https://packages.adoptium.net/artifactory/deb ${try_codename} main" \
-            | tee /etc/apt/sources.list.d/adoptium.list > /dev/null
-
-        if apt-get update -qq 2>/dev/null && apt-get install -y -qq temurin-21-jdk 2>/dev/null; then
-            apt_success=true
-            if [[ "$try_codename" != "$codename" ]]; then
-                warn "Your codename '${codename}' is not yet supported by Adoptium."
-                warn "Installed using '${try_codename}' repo (binary compatible)."
-            fi
-            break
-        else
-            warn "Adoptium repo for '${try_codename}' failed, trying next option …"
-            rm -f /etc/apt/sources.list.d/adoptium.list
-        fi
-    done
-
-    # ── Strategy 2: Direct tarball download to /opt ──────────────────────
-    #    If the apt repo doesn't work at all, grab the tarball from the
-    #    Adoptium API. This also fits the /opt install preference.
-    if [[ "$apt_success" == false ]]; then
-        warn "Adoptium apt repo unavailable — falling back to direct tarball install."
-
-        local arch
-        arch=$(dpkg --print-architecture)
-        # Map Debian arch names to Adoptium API names
-        case "$arch" in
-            amd64)  arch="x64" ;;
-            arm64)  arch="aarch64" ;;
-            *)      arch="$arch" ;;
-        esac
+        add_apt_keyring adoptium "https://packages.adoptium.net/artifactory/api/gpg/key/public"
+        echo "deb [signed-by=${KEYRING_DIR}/adoptium.gpg] https://packages.adoptium.net/artifactory/deb ${suite} main" \
+            > /etc/apt/sources.list.d/adoptium.list
+        apt_update
+        apt_install temurin-21-jdk
+    else
+        # No usable apt suite at all — install the tarball to /opt instead.
+        warn "Adoptium apt repo unavailable — falling back to a tarball install in ${OPT_DIR}."
+        warn "Tarball installs don't auto-update via apt; re-run this script for newer builds."
 
         local java_dir="${OPT_DIR}/temurin-21-jdk"
+        rm -rf "$java_dir"
         mkdir -p "$java_dir"
 
-        local download_url="https://api.adoptium.net/v3/binary/latest/21/ga/linux/${arch}/jdk/hotspot/normal/eclipse"
+        "${CURL[@]}" "https://api.adoptium.net/v3/binary/latest/21/ga/linux/${ARCH_JAVA}/jdk/hotspot/normal/eclipse" \
+            -o "${WORKDIR}/temurin-21.tar.gz"
+        tar -xzf "${WORKDIR}/temurin-21.tar.gz" -C "$java_dir" --strip-components=1
 
-        info "Downloading Temurin 21 JDK tarball …"
-        curl -fsSL -o /tmp/temurin-21.tar.gz "$download_url"
-        tar -xzf /tmp/temurin-21.tar.gz -C "$java_dir" --strip-components=1
-        rm -f /tmp/temurin-21.tar.gz
-
-        # Symlink binaries
-        ln -sf "${java_dir}/bin/java"  /usr/local/bin/java
-        ln -sf "${java_dir}/bin/javac" /usr/local/bin/javac
-        ln -sf "${java_dir}/bin/jar"   /usr/local/bin/jar
-
-        info "Note: tarball installs don't auto-update via apt."
-        info "Re-run this script or check adoptium.net for newer releases."
+        local bin
+        for bin in java javac jar; do
+            ln -sf "${java_dir}/bin/${bin}" "/usr/local/bin/${bin}"
+        done
     fi
 
     success "Adoptium Temurin 21 JDK installed."
-    java --version
 }
 
-# ── Module: Gradle ───────────────────────────────────────────────────────────
+# ── Module: Gradle ──────────────────────────────────────────────────────────
 install_gradle() {
     info "Installing Gradle …"
-    local latest
-    latest=$(curl -fsSL "https://services.gradle.org/versions/current" | jq -r '.version')
+    local version
+    version="$("${CURL[@]}" "https://services.gradle.org/versions/current" | jq -r '.version')"
+
+    "${CURL[@]}" "https://services.gradle.org/distributions/gradle-${version}-bin.zip" \
+        -o "${WORKDIR}/gradle.zip"
+    unzip -qo "${WORKDIR}/gradle.zip" -d "${WORKDIR}/gradle-extract"
 
     local gradle_dir="${OPT_DIR}/gradle"
-    mkdir -p "$gradle_dir"
-
-    curl -fsSL "https://services.gradle.org/distributions/gradle-${latest}-bin.zip" \
-        -o /tmp/gradle.zip
-    unzip -qo /tmp/gradle.zip -d /tmp/gradle-extract
-    cp -rf /tmp/gradle-extract/gradle-${latest}/* "$gradle_dir"/
+    rm -rf "$gradle_dir"
+    mv "${WORKDIR}/gradle-extract/gradle-${version}" "$gradle_dir"
     ln -sf "${gradle_dir}/bin/gradle" /usr/local/bin/gradle
-    rm -rf /tmp/gradle.zip /tmp/gradle-extract
-    success "Gradle ${latest} installed to ${gradle_dir}."
+    success "Gradle ${version} installed to ${gradle_dir}."
 }
 
-# ── Module: Rust ─────────────────────────────────────────────────────────────
+# ── Module: Rust ────────────────────────────────────────────────────────────
 install_rust() {
     info "Installing Rust via rustup for ${ACTUAL_USER} …"
     run_as_user 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
-    success "Rust installed. Source \$HOME/.cargo/env to use."
+    success "Rust installed. Source \$HOME/.cargo/env to use it now."
 }
 
 # ── Module: Python (uv) ─────────────────────────────────────────────────────
 install_python() {
-    info "Installing Python tooling (uv) …"
+    info "Installing Python tooling (uv) for ${ACTUAL_USER} …"
     run_as_user 'curl -LsSf https://astral.sh/uv/install.sh | sh'
     success "uv installed. Use 'uv python install' to grab Python versions."
 }
 
-# ── Module: C/C++ ────────────────────────────────────────────────────────────
+# ── Module: C/C++ ───────────────────────────────────────────────────────────
 install_cpp() {
     info "Installing C/C++ toolchain …"
-    apt-get install -y -qq build-essential gcc g++ cmake make gdb
+    apt_install build-essential gcc g++ cmake make gdb pkg-config
     success "gcc/g++/cmake/make/gdb installed."
 }
 
-# ── Module: Docker ───────────────────────────────────────────────────────────
+# ── Module: Docker ──────────────────────────────────────────────────────────
 install_docker() {
     info "Installing Docker Engine …"
 
-    if ! command -v docker &>/dev/null; then
-        install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-            -o /etc/apt/keyrings/docker.asc
-        chmod a+r /etc/apt/keyrings/docker.asc
+    if command -v docker >/dev/null; then
+        warn "Docker already installed — skipping package install."
+    else
+        local suite
+        if ! suite="$(pick_apt_suite "https://download.docker.com/linux/ubuntu" "$OS_CODENAME" noble)"; then
+            fail "Docker's apt repo is unreachable."
+            return 1
+        fi
+        if [[ "$suite" != "$OS_CODENAME" ]]; then
+            warn "Docker has no '${OS_CODENAME}' repo yet — using '${suite}'."
+        fi
 
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+        add_apt_keyring docker "https://download.docker.com/linux/ubuntu/gpg"
+        echo "deb [arch=${ARCH_DEB} signed-by=${KEYRING_DIR}/docker.gpg] https://download.docker.com/linux/ubuntu ${suite} stable" \
             > /etc/apt/sources.list.d/docker.list
 
-        apt-get update -qq
-        apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
+        apt_update
+        apt_install docker-ce docker-ce-cli containerd.io \
             docker-buildx-plugin docker-compose-plugin
-    else
-        warn "Docker already installed — skipping."
     fi
 
     usermod -aG docker "$ACTUAL_USER"
-    success "Docker installed. ${ACTUAL_USER} added to docker group (re-login to take effect)."
+    success "Docker installed — ${ACTUAL_USER} added to the docker group (applies after re-login)."
 }
 
 # ── Module: Node.js LTS (to /opt) ───────────────────────────────────────────
 install_nodejs() {
     info "Installing Node.js LTS to ${OPT_DIR} …"
-
-    # Fetch the latest LTS version
-    local node_version
-    node_version=$(curl -fsSL https://nodejs.org/dist/index.json \
-        | jq -r '[.[] | select(.lts != false)][0].version')
+    local version
+    version="$("${CURL[@]}" "https://nodejs.org/dist/index.json" \
+        | jq -r '[.[] | select(.lts != false)][0].version')"
 
     local node_dir="${OPT_DIR}/nodejs"
+    rm -rf "$node_dir"
     mkdir -p "$node_dir"
 
-    curl -fsSL "https://nodejs.org/dist/${node_version}/node-${node_version}-linux-x64.tar.xz" \
-        -o /tmp/node.tar.xz
-    tar -xf /tmp/node.tar.xz -C "$node_dir" --strip-components=1
-    rm -f /tmp/node.tar.xz
+    "${CURL[@]}" "https://nodejs.org/dist/${version}/node-${version}-linux-${ARCH_NODE}.tar.xz" \
+        -o "${WORKDIR}/node.tar.xz"
+    tar -xf "${WORKDIR}/node.tar.xz" -C "$node_dir" --strip-components=1
 
-    # Symlink binaries
+    local bin
     for bin in node npm npx corepack; do
-        ln -sf "${node_dir}/bin/${bin}" /usr/local/bin/${bin}
+        if [[ -e "${node_dir}/bin/${bin}" ]]; then
+            ln -sf "${node_dir}/bin/${bin}" "/usr/local/bin/${bin}"
+        fi
     done
-
-    success "Node.js ${node_version} installed to ${node_dir}."
+    success "Node.js ${version} installed to ${node_dir}."
 }
 
-# ── Post-install: shell profile paths ────────────────────────────────────────
-write_path_snippet() {
-    info "Writing /etc/profile.d/custom-paths.sh for /opt tools …"
+# ── Module: Claude Code ─────────────────────────────────────────────────────
+install_claude() {
+    info "Installing Claude Code for ${ACTUAL_USER} …"
+    # Official native installer — standalone binary, no Node.js required.
+    run_as_user 'curl -fsSL https://claude.ai/install.sh | bash'
+    success "Claude Code installed to ${ACTUAL_HOME}/.local/bin/claude."
+}
 
-    # Auto-detect JAVA_HOME: tarball in /opt takes priority, then apt location
-    local java_home=""
-    if [[ -d "${OPT_DIR}/temurin-21-jdk/bin" ]]; then
+# ── Post-install: shell profile paths ───────────────────────────────────────
+write_path_snippet() {
+    heading "post" "Shell profile (PATH for /opt tools & ~/.local/bin)"
+
+    local java_home="" d
+    if [[ -d "${OPT_DIR}/temurin-21-jdk" ]]; then
         java_home="${OPT_DIR}/temurin-21-jdk"
-    elif [[ -d "/usr/lib/jvm/temurin-21-jdk-amd64" ]]; then
-        java_home="/usr/lib/jvm/temurin-21-jdk-amd64"
-    elif [[ -d "/usr/lib/jvm/temurin-21-jdk-arm64" ]]; then
-        java_home="/usr/lib/jvm/temurin-21-jdk-arm64"
+    else
+        for d in /usr/lib/jvm/temurin-21-jdk-*; do
+            if [[ -d "$d" ]]; then
+                java_home="$d"
+                break
+            fi
+        done
     fi
 
-    cat > /etc/profile.d/custom-paths.sh <<PATHS
-# Added by ubuntu-setup.sh
-export PATH="/opt/nodejs/bin:/opt/nvim/bin:/opt/gradle/bin:\$PATH"
-${java_home:+export JAVA_HOME="${java_home}"}
-PATHS
-    success "Path snippet written. Will apply on next login."
+    # POSIX snippet, existence-checked and dedup-guarded, so it is safe to
+    # source from /etc/profile.d (bash/dash) AND /etc/zsh/zshenv (every zsh).
+    # Last entry in the list ends up first in PATH, so ~/.local/bin wins.
+    cat > /etc/profile.d/custom-paths.sh <<EOF
+# Generated by ubuntu-setup.sh — dev tool paths
+for _d in ${OPT_DIR}/gradle/bin ${OPT_DIR}/nvim/bin ${OPT_DIR}/nodejs/bin "\$HOME/.local/bin"; do
+    if [ -d "\$_d" ]; then
+        case ":\$PATH:" in
+            *":\$_d:"*) ;;
+            *) PATH="\$_d:\$PATH" ;;
+        esac
+    fi
+done
+unset _d
+export PATH
+EOF
+    if [[ -n "$java_home" ]]; then
+        printf 'export JAVA_HOME="%s"\n' "$java_home" >> /etc/profile.d/custom-paths.sh
+    fi
+
+    # Zsh login shells do not source /etc/profile.d on Ubuntu — hook the same
+    # snippet into the system-wide zshenv (idempotently) so zsh users get it.
+    if [[ -d /etc/zsh ]] && ! grep -qs 'custom-paths.sh' /etc/zsh/zshenv; then
+        cat >> /etc/zsh/zshenv <<'EOF'
+
+# Added by ubuntu-setup.sh — zsh does not source /etc/profile.d
+if [ -f /etc/profile.d/custom-paths.sh ]; then
+    . /etc/profile.d/custom-paths.sh
+fi
+EOF
+    fi
+
+    success "Wrote /etc/profile.d/custom-paths.sh (hooked into bash/sh and zsh)."
 }
 
-# ── Summary ──────────────────────────────────────────────────────────────────
+# ── Summary ─────────────────────────────────────────────────────────────────
 print_summary() {
-    echo ""
-    echo -e "${BOLD}${GREEN}"
-    echo "  ╔══════════════════════════════════════════════════════════════╗"
-    echo "  ║                    Setup complete! 🎉                      ║"
-    echo "  ╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-    echo -e "  ${BOLD}Next steps:${NC}"
-    echo "    • Log out and back in (or reboot) so group/shell changes apply."
-    echo "    • Clone your dotfiles repo and run: cd dotfiles && stow <package>"
-    echo "    • Source Rust env:  source \$HOME/.cargo/env"
-    echo "    • Install a Python: uv python install 3.12"
+    local mins=$(( SECONDS / 60 )) secs=$(( SECONDS % 60 ))
+
+    printf '\n%s\n' "  ${DIM}${RULE}${NC}"
+    printf '%s\n' "  ${BOLD}${GREEN}Setup complete${NC}${BOLD} — ${TOTAL_STEPS} modules in ${mins}m ${secs}s${NC}"
+    printf '%s\n\n' "  ${DIM}${RULE}${NC}"
+
+    printf '%s\n' "  ${BOLD}Next steps${NC}"
+    echo "    • Log out and back in (or reboot) so shell, group and PATH changes apply."
+    if [[ ${SELECTED[stow]} -eq 1 ]]; then
+        echo "    • Clone your dotfiles and run:  cd dotfiles && stow <package>"
+    fi
+    if [[ ${SELECTED[rust]} -eq 1 ]]; then
+        echo "    • Rust:  source \"\$HOME/.cargo/env\" (or just re-login)."
+    fi
+    if [[ ${SELECTED[python]} -eq 1 ]]; then
+        echo "    • Python:  uv python install 3.13"
+    fi
+    if [[ ${SELECTED[docker]} -eq 1 ]]; then
+        echo "    • Docker:  test with 'docker run hello-world' after re-login."
+    fi
+    if [[ ${SELECTED[claude]} -eq 1 ]]; then
+        echo "    • Claude Code:  run 'claude' in a project to sign in."
+    fi
     echo ""
 }
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Orchestration ───────────────────────────────────────────────────────────
+run_module() {
+    local key="$1"
+    STEP_INDEX=$((STEP_INDEX + 1))
+    CURRENT_MODULE="${MODULES[$key]}"
+    heading "${STEP_INDEX}/${TOTAL_STEPS}" "$CURRENT_MODULE"
+    "install_${key}"
+    CURRENT_MODULE=""
+}
+
 main() {
+    parse_args "$@"
     need_root
-    interactive_menu
+    detect_system
 
-    echo ""
-    info "Starting installation …"
-    echo ""
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'on_error $LINENO' ERR
+    WORKDIR="$(mktemp -d)"
 
-    do_apt_update
+    if [[ "$RUN_MODE" == "menu" ]]; then
+        interactive_menu
+    fi
 
-    [[ ${SELECTED[clitools]} -eq 1 ]] && install_clitools
-    [[ ${SELECTED[zsh]}      -eq 1 ]] && install_zsh
-    [[ ${SELECTED[firacode]} -eq 1 ]] && install_firacode
-    [[ ${SELECTED[ghostty]}  -eq 1 ]] && install_ghostty
-    [[ ${SELECTED[neovim]}   -eq 1 ]] && install_neovim
-    [[ ${SELECTED[stow]}     -eq 1 ]] && install_stow
-    [[ ${SELECTED[java]}     -eq 1 ]] && install_java
-    [[ ${SELECTED[gradle]}   -eq 1 ]] && install_gradle
-    [[ ${SELECTED[rust]}     -eq 1 ]] && install_rust
-    [[ ${SELECTED[python]}   -eq 1 ]] && install_python
-    [[ ${SELECTED[cpp]}      -eq 1 ]] && install_cpp
-    [[ ${SELECTED[docker]}   -eq 1 ]] && install_docker
-    [[ ${SELECTED[nodejs]}   -eq 1 ]] && install_nodejs
+    TOTAL_STEPS="$(selected_count)"
+    printf '\n%s\n' "  ${BOLD}Installing ${TOTAL_STEPS} of ${#MODULE_ORDER[@]} modules${NC} ${DIM}(${OS_PRETTY} · ${ARCH_DEB} · user: ${ACTUAL_USER})${NC}"
+
+    SECONDS=0
+    base_prepare
+
+    local key
+    for key in "${MODULE_ORDER[@]}"; do
+        if [[ ${SELECTED[$key]} -eq 1 ]]; then
+            run_module "$key"
+        fi
+    done
 
     write_path_snippet
     print_summary
 }
 
-main "$@"
+# Allow sourcing for tests without running anything.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
